@@ -58,6 +58,7 @@ var (
 var (
 	nameToCatalogMap = map[string]*internal.Catalog{}
 	nameToDBMap      = map[string]*sql.DB{}
+	nameToDBOwners   = map[string]int{}
 	nameToValueMapMu sync.Mutex
 )
 
@@ -139,6 +140,7 @@ func newDBAndCatalog(name string) (*sql.DB, *internal.Catalog, error) {
 	defer nameToValueMapMu.Unlock()
 	db, exists := nameToDBMap[name]
 	if exists {
+		nameToDBOwners[name]++
 		return db, nameToCatalogMap[name], nil
 	}
 	db, err := sql.Open(internalDriverName, name)
@@ -147,6 +149,7 @@ func newDBAndCatalog(name string) (*sql.DB, *internal.Catalog, error) {
 	}
 	catalog := internal.NewCatalog(db)
 	nameToDBMap[name] = db
+	nameToDBOwners[name] = 1
 	nameToCatalogMap[name] = catalog
 	return db, catalog, nil
 }
@@ -160,7 +163,13 @@ func (d *Driver) Open(name string) (driver.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return c.Connect(context.Background())
+	conn, err := c.Connect(context.Background())
+	if err != nil {
+		_ = c.(*connector).Close()
+		return nil, err
+	}
+	conn.(*Conn).closeOwner = c.(*connector).Close
+	return conn, nil
 }
 
 // memoryConnectorSeq mints a unique suffix per :memory: connector so each
@@ -182,10 +191,18 @@ type connector struct {
 	innerOwned bool
 	innerName  string
 	txLock     string
+	shared     bool
+	// The outer sql.DB owns one reference; pooled Conn values do not.
+	closeOnce sync.Once
+	closeErr  error
+	closed    atomic.Bool
 }
 
 func (c *connector) Connect(_ context.Context) (dc driver.Conn, e error) {
 	defer recoverPanicAsError(&e)
+	if c.closed.Load() {
+		return nil, driver.ErrBadConn
+	}
 	conn, err := newConn(c.inner, c.catalog)
 	if err != nil {
 		return nil, err
@@ -193,6 +210,7 @@ func (c *connector) Connect(_ context.Context) (dc driver.Conn, e error) {
 	conn.txLock = c.txLock
 	if c.driver.ConnectHook != nil {
 		if err := c.driver.ConnectHook(conn); err != nil {
+			_ = conn.Close()
 			return nil, err
 		}
 	}
@@ -202,13 +220,27 @@ func (c *connector) Connect(_ context.Context) (dc driver.Conn, e error) {
 func (c *connector) Driver() driver.Driver { return c.driver }
 
 func (c *connector) Close() error {
-	if !c.innerOwned {
-		return nil
-	}
-	nameToValueMapMu.Lock()
-	delete(nameToCatalogMap, c.innerName)
-	nameToValueMapMu.Unlock()
-	return c.inner.Close()
+	c.closeOnce.Do(func() {
+		c.closed.Store(true)
+		closeBackend := c.innerOwned
+		nameToValueMapMu.Lock()
+		if c.innerOwned {
+			delete(nameToCatalogMap, c.innerName)
+		} else if c.shared && nameToDBMap[c.name] == c.inner {
+			nameToDBOwners[c.name]--
+			if nameToDBOwners[c.name] == 0 {
+				delete(nameToDBOwners, c.name)
+				delete(nameToDBMap, c.name)
+				delete(nameToCatalogMap, c.name)
+				closeBackend = true
+			}
+		}
+		nameToValueMapMu.Unlock()
+		if closeBackend {
+			c.closeErr = c.inner.Close()
+		}
+	})
+	return c.closeErr
 }
 
 func (d *Driver) OpenConnector(name string) (driver.Connector, error) {
@@ -235,7 +267,7 @@ func (d *Driver) OpenConnector(name string) (driver.Connector, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &connector{driver: d, name: name, inner: db, catalog: catalog, txLock: txLock}, nil
+	return &connector{driver: d, name: name, inner: db, catalog: catalog, txLock: txLock, shared: true}, nil
 }
 
 func txLockFromDSN(name string) (string, error) {
@@ -311,6 +343,7 @@ func freshMemoryDSN(name string) string {
 var _ driver.DriverContext = (*Driver)(nil)
 
 type Conn struct {
+	closeOwner     func() error
 	conn           *sql.Conn
 	txActive       bool
 	txReset        string
@@ -392,6 +425,7 @@ func newConn(db *sql.DB, catalog *internal.Catalog) (*Conn, error) {
 	}
 	analyzer, err := internal.NewAnalyzer(catalog)
 	if err != nil {
+		_ = conn.Close()
 		return nil, fmt.Errorf("failed to create analyzer: %w", err)
 	}
 	return &Conn{
@@ -551,7 +585,14 @@ func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 }
 
 func (c *Conn) Close() error {
-	return c.conn.Close()
+	err := c.conn.Close()
+	if c.closeOwner != nil {
+		ownerErr := c.closeOwner()
+		if err == nil {
+			err = ownerErr
+		}
+	}
+	return err
 }
 
 func (c *Conn) BeginTx(ctx context.Context, opts driver.TxOptions) (t driver.Tx, e error) {
