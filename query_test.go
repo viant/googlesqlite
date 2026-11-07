@@ -870,6 +870,111 @@ func TestCaseExpression(t *testing.T) {
 	}
 }
 
+func TestUnaryMinus(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:?_test=unary_minus")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE metrics (spend FLOAT64, clicks INT64);
+		INSERT INTO metrics (spend, clicks) VALUES (5.0, 2), (5.0, 0)`); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name    string
+		query   string
+		args    []any
+		want    any
+		wantErr string
+	}{
+		{
+			name:  "case expression",
+			query: "SELECT -(CASE WHEN TRUE THEN 2 ELSE 0 END) AS value",
+			want:  int64(-2),
+		},
+		{
+			name:  "row value",
+			query: "SELECT -(CASE WHEN x > 0 THEN x ELSE 0 END) FROM UNNEST([9007199254740993]) AS x",
+			want:  int64(-9007199254740993),
+		},
+		{
+			name:  "float parameter",
+			query: "SELECT -@x",
+			args:  []any{sql.Named("x", float64(2.5))},
+			want:  float64(-2.5),
+		},
+		{
+			name:  "row float division",
+			query: "SELECT -(CASE WHEN clicks >= 0 THEN spend / NULLIF(clicks, 0) END) FROM metrics WHERE clicks = 2",
+			want:  float64(-2.5),
+		},
+		{
+			name:  "numeric parameter",
+			query: "SELECT CAST(-CAST(@x AS NUMERIC) AS STRING)",
+			args:  []any{sql.Named("x", "9007199254740993.000000001")},
+			want:  "-9007199254740993.000000001",
+		},
+		{
+			name:  "bignumeric parameter",
+			query: "SELECT CAST(-CAST(@x AS BIGNUMERIC) AS STRING)",
+			args:  []any{sql.Named("x", "9007199254740993.00000000000000000000000000000000000001")},
+			want:  "-9007199254740993.00000000000000000000000000000000000001",
+		},
+		{
+			name:  "null row value",
+			query: "SELECT -(CASE WHEN clicks >= 0 THEN spend / NULLIF(clicks, 0) END) FROM metrics WHERE clicks = 0",
+		},
+		{
+			name:    "int64 overflow",
+			query:   "SELECT -@x",
+			args:    []any{sql.Named("x", int64(math.MinInt64))},
+			wantErr: "INT64 overflow",
+		},
+		{
+			name:  "int32 literal",
+			query: "SELECT -CAST(2147483647 AS INT32)",
+			want:  int64(-2147483647),
+		},
+		{
+			name:    "int32 parameter overflow",
+			query:   "SELECT -CAST(@x AS INT32)",
+			args:    []any{sql.Named("x", int64(math.MinInt32))},
+			wantErr: "INT32 overflow",
+		},
+		{
+			name:    "int32 row overflow",
+			query:   "SELECT -x FROM UNNEST([CAST(-2147483648 AS INT32)]) AS x",
+			wantErr: "INT32 overflow",
+		},
+		{
+			name:    "bignumeric overflow",
+			query:   "SELECT -x FROM UNNEST([BIGNUMERIC '-578960446186580977117854925043439539266.34992332820282019728792003956564819968']) AS x",
+			wantErr: "BIGNUMERIC overflow",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var got any
+			err := db.QueryRowContext(ctx, test.query, test.args...).Scan(&got)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("got value %v and error %v; want error containing %q", got, err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Errorf("got %v (%T); want %v (%T)", got, got, test.want, test.want)
+			}
+		})
+	}
+}
+
 // TestNumericAndBignumericArithmetic exercises the NUMERIC arithmetic
 // path and ensures error reporting for divide-by-zero. Per the project
 // "Numeric div by zero" fix in numeric_divzero_test.go.

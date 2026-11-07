@@ -45,6 +45,8 @@ import (
 var normalFuncs = []*funcInfo{
 	{Name: "add", BindFunc: helper.Scalar2(mathfn.ADD)},
 	{Name: "subtract", BindFunc: helper.Scalar2(mathfn.SUB)},
+	{Name: "unary_minus", BindFunc: helper.Scalar1(mathfn.UNARY_MINUS)},
+	{Name: "unary_minus_int32", BindFunc: helper.Scalar1(mathfn.UNARY_MINUS_INT32)},
 	{Name: "multiply", BindFunc: helper.Scalar2(mathfn.MUL)},
 	{Name: "divide", BindFunc: helper.Scalar2(mathfn.OP_DIV)},
 	{Name: "equal", BindFunc: helper.Scalar2(operator.EQ)},

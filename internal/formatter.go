@@ -177,6 +177,12 @@ func getFuncNameAndArgs(ctx context.Context, node *ResolvedBaseFunctionCallNode,
 		funcPrefix = "googlesqlite_safe"
 	}
 
+	// SQLite uses the same integer representation for INT32 and INT64.
+	// Preserve the resolved width for unary minus overflow checking.
+	if funcName == "$unary_minus" && m1(m1(node.Type()).Kind()) == googlesql.TypeKindTypeInt32 {
+		funcName = "$unary_minus_int32"
+	}
+
 	if strings.HasPrefix(funcName, "$") {
 		if isWindowFunc {
 			funcName = fmt.Sprintf("%s_window_%s", funcPrefix, funcName[1:])
